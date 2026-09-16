@@ -91,6 +91,7 @@
   "manual_enter": "手动输入",
   "pairing_code": "配对码",
   "unlock_test": "解锁测试",
+  "unlock_retry_limit": "手机解锁连续失败，已暂停自动重试。请点击“重试”或直接输入密码。",
   "install": "安装",
   "uninstall": "卸载",
   "reinstall": "重新安装",

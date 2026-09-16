@@ -379,6 +379,7 @@ HRESULT CUnlockCredential::CommandLinkClicked(__in DWORD dwFieldID) {
       _unlockResult = {};
     }
     if(_pUnlockListener != nullptr) {
+      _pUnlockListener->ResetFailures();
       _pUnlockListener->Stop();
       _pUnlockListener->Start(true);
     }

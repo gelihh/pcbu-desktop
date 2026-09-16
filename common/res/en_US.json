@@ -92,6 +92,7 @@
   "manual_enter": "Enter manually",
   "pairing_code": "Pairing code",
   "unlock_test": "Unlock test",
+  "unlock_retry_limit": "Unlock failed repeatedly. Automatic retry paused - press Retry or type your password.",
 
   "install": "Install",
   "uninstall": "Uninstall",

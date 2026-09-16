@@ -6,6 +6,7 @@
 #include "platform/NetworkHelper.h"
 #include "storage/AppSettings.h"
 #include "utils/StringUtils.h"
+#include <spdlog/spdlog.h>
 
 void CUnlockListener::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus, CSampleProvider *pCredentialProvider, CUnlockCredential *pCredential,
                                  const std::wstring &userDomain) {
@@ -19,10 +20,21 @@ void CUnlockListener::Release() {
   Stop();
 }
 
+// After this many failed unlock attempts in a row, stop restarting the listener
+// automatically (e.g. when LogonUI re-selects the tile) and require the user to
+// press "Retry" or type their password instead.
+static constexpr int MAX_CONSECUTIVE_FAILURES = 3;
+
 void CUnlockListener::Start(bool ignoreWaitKeyPress) {
   if(m_IsRunning)
     return;
+  if(!ignoreWaitKeyPress && m_ConsecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    m_Credential->UpdateMessage(I18n::Get("unlock_retry_limit"));
+    spdlog::warn("Unlock failed {} times in a row, automatic retry paused.", MAX_CONSECUTIVE_FAILURES);
+    return;
+  }
   Stop();
+  m_StopRequested = false;
   m_IsRunning = true;
   m_IgnoreWaitKeyPress = ignoreWaitKeyPress;
   m_ListenThread = std::thread(&CUnlockListener::ListenThread, this);
@@ -31,10 +43,18 @@ void CUnlockListener::Start(bool ignoreWaitKeyPress) {
 void CUnlockListener::Stop() {
   if(!m_IsRunning)
     return;
+  // Mark an external stop so the listen thread does not call back into LogonUI
+  // (SetUnlockData/UpdateCredsStatus) while Stop() is joining it - those calls
+  // re-enter LogonUI from a worker thread and can deadlock the logon screen.
+  m_StopRequested = true;
   m_IsRunning = false;
   m_IgnoreWaitKeyPress = false;
   if(m_ListenThread.joinable())
     m_ListenThread.join();
+}
+
+void CUnlockListener::ResetFailures() {
+  m_ConsecutiveFailures = 0;
 }
 
 bool CUnlockListener::HasResponse() const {
@@ -125,7 +145,16 @@ void CUnlockListener::ListenThread() {
   auto handler = UnlockHandler(printMessage);
   const auto result = handler.GetResult(userDomainStr, "Windows-Login", &m_IsRunning);
 
+  // External Stop(): LogonUI is waiting on this thread and must not be re-entered
+  // from here, otherwise the logon screen can deadlock.
+  if(m_StopRequested)
+    return;
+
   m_HasResponse = true;
+  if(result.state == UnlockState::SUCCESS)
+    m_ConsecutiveFailures = 0;
+  else
+    m_ConsecutiveFailures++;
   m_Credential->SetUnlockData(result);
   m_CredentialProvider->UpdateCredsStatus();
 }

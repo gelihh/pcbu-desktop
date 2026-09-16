@@ -17,6 +17,7 @@ public:
 
   void Start(bool ignoreWaitKeyPress = false);
   void Stop();
+  void ResetFailures();
 
   bool HasResponse() const;
 
@@ -25,6 +26,8 @@ private:
 
   std::thread m_ListenThread{};
   std::atomic<bool> m_IsRunning{};
+  std::atomic<bool> m_StopRequested{false};
+  std::atomic<int> m_ConsecutiveFailures{0};
   bool m_HasResponse{};
   bool m_IgnoreWaitKeyPress{};
 
