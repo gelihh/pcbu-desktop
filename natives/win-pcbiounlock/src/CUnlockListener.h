@@ -23,6 +23,7 @@ public:
 
 private:
   void ListenThread();
+  void PushMessage(const std::string &message);
 
   std::thread m_ListenThread{};
   std::atomic<bool> m_IsRunning{};

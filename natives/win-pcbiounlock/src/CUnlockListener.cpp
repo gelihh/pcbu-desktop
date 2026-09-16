@@ -29,8 +29,9 @@ void CUnlockListener::Start(bool ignoreWaitKeyPress) {
   if(m_IsRunning)
     return;
   if(!ignoreWaitKeyPress && m_ConsecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-    m_Credential->UpdateMessage(I18n::Get("unlock_retry_limit"));
-    spdlog::warn("Unlock failed {} times in a row, automatic retry paused.", MAX_CONSECUTIVE_FAILURES);
+    // No UI update here: Start() runs on LogonUI's own thread (SetSelected), and
+    // pushing a field change from inside that call re-enters LogonUI.
+    spdlog::warn("Unlock failed {} times in a row, automatic retry paused. Use Retry or password.", MAX_CONSECUTIVE_FAILURES);
     return;
   }
   Stop();
@@ -57,6 +58,16 @@ void CUnlockListener::ResetFailures() {
   m_ConsecutiveFailures = 0;
 }
 
+// Every message from the listen thread reaches LogonUI through this function. Once
+// an external Stop() is in flight, LogonUI's UI thread is blocked joining this
+// thread, so any callback would deadlock the logon screen (it freezes on the
+// welcome screen and the machine has to be powered off). Skip them instead.
+void CUnlockListener::PushMessage(const std::string &message) {
+  if(m_StopRequested || m_Credential == nullptr)
+    return;
+  m_Credential->UpdateMessage(message);
+}
+
 bool CUnlockListener::HasResponse() const {
   return m_HasResponse;
 }
@@ -73,11 +84,11 @@ void GetAllKeyState(byte *keys, size_t len) {
 
 void CUnlockListener::ListenThread() {
   // Init
-  m_Credential->UpdateMessage(I18n::Get("initializing"));
+  PushMessage(I18n::Get("initializing"));
   const auto userDomainStr = StringUtils::FromWideString(m_UserDomain);
   const auto userSplit = StringUtils::Split(userDomainStr, "\\");
   if(userSplit.size() != 2) {
-    m_Credential->UpdateMessage(I18n::Get("error_invalid_user"));
+    PushMessage(I18n::Get("error_invalid_user"));
     return;
   }
 
@@ -93,13 +104,13 @@ void CUnlockListener::ListenThread() {
 
     // Network
     if(waitForNetwork) {
-      m_Credential->UpdateMessage(I18n::Get("wait_network"));
+      PushMessage(I18n::Get("wait_network"));
       while(m_IsRunning) {
         auto isAbort = GetAsyncKeyState(VK_LCONTROL) < 0 && GetAsyncKeyState(VK_LMENU) < 0;
         if(NetworkHelper::HasLANConnection() || isAbort) {
           if(isAbort) {
             m_HasResponse = true;
-            m_Credential->UpdateMessage(I18n::Get("unlock_canceled"));
+            PushMessage(I18n::Get("unlock_canceled"));
             return;
           }
           break;
@@ -113,7 +124,7 @@ void CUnlockListener::ListenThread() {
       const bool isUnlock = m_ProviderUsage == CPUS_UNLOCK_WORKSTATION || (m_ProviderUsage == CPUS_LOGON && isUserLoggedOn);
       if(storage.winUnlockBehavior == "key_press"  || (storage.winUnlockBehavior == "key_press_lock_only" && isUnlock)) {
         Sleep(500);
-        m_Credential->UpdateMessage(I18n::Get("wait_key_press"));
+        PushMessage(I18n::Get("wait_key_press"));
         byte lastKeys[KEY_RANGE];
         GetAllKeyState(lastKeys, KEY_RANGE);
         while(m_IsRunning) {
@@ -141,14 +152,16 @@ void CUnlockListener::ListenThread() {
   }
 
   // Unlock
-  std::function<void(const std::string&)> printMessage = [this](const std::string &s) { m_Credential->UpdateMessage(s); };
+  std::function<void(const std::string&)> printMessage = [this](const std::string &s) { PushMessage(s); };
   auto handler = UnlockHandler(printMessage);
   const auto result = handler.GetResult(userDomainStr, "Windows-Login", &m_IsRunning);
 
   // External Stop(): LogonUI is waiting on this thread and must not be re-entered
   // from here, otherwise the logon screen can deadlock.
-  if(m_StopRequested)
+  if(m_StopRequested) {
+    spdlog::info("Listener stopped externally, logon UI callbacks suppressed.");
     return;
+  }
 
   m_HasResponse = true;
   if(result.state == UnlockState::SUCCESS)
@@ -156,5 +169,7 @@ void CUnlockListener::ListenThread() {
   else
     m_ConsecutiveFailures++;
   m_Credential->SetUnlockData(result);
+  if(m_ConsecutiveFailures >= MAX_CONSECUTIVE_FAILURES)
+    PushMessage(I18n::Get("unlock_retry_limit"));
   m_CredentialProvider->UpdateCredsStatus();
 }
