@@ -100,6 +100,9 @@ public:
   bool IsUnlockSuccess() const;
   void SetUnlockData(const UnlockResult &result);
   void UpdateMessage(const std::string &message);
+  // Signals the unlock listener to stop. Called by the provider before it releases
+  // the credentials so that no worker can outlive the provider it reports to.
+  void StopListener();
 
 public:
   virtual ~CUnlockCredential();

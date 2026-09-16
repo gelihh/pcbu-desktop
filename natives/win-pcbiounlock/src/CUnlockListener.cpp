@@ -38,32 +38,57 @@ void CUnlockListener::Start(bool ignoreWaitKeyPress) {
   m_StopRequested = false;
   m_IsRunning = true;
   m_IgnoreWaitKeyPress = ignoreWaitKeyPress;
-  m_ListenThread = std::thread(&CUnlockListener::ListenThread, this);
+  const auto generation = ++m_Generation;
+  auto *credential = m_Credential;
+  auto workerRunning = std::make_shared<std::atomic<bool>>(true);
+  m_WorkerRunning = workerRunning;
+  m_ListenThread = std::thread([this, credential, generation, workerRunning] {
+    // Stop() detaches instead of joining, so the tile (and with it this listener)
+    // may be released before the thread ends. Holding a credential reference keeps
+    // both objects alive until the worker is really done.
+    if(credential != nullptr)
+      credential->AddRef();
+    ListenThread(generation, workerRunning);
+    if(credential != nullptr)
+      credential->Release();
+  });
 }
 
 void CUnlockListener::Stop() {
   if(!m_IsRunning)
     return;
-  // Mark an external stop so the listen thread does not call back into LogonUI
-  // (SetUnlockData/UpdateCredsStatus) while Stop() is joining it - those calls
-  // re-enter LogonUI from a worker thread and can deadlock the logon screen.
+  // Invalidate the running worker first: it must not call back into LogonUI once
+  // the logon screen starts tearing the tile down.
   m_StopRequested = true;
+  ++m_Generation;
+  if(m_WorkerRunning)
+    m_WorkerRunning->store(false);
   m_IsRunning = false;
   m_IgnoreWaitKeyPress = false;
-  if(m_ListenThread.joinable())
-    m_ListenThread.join();
+  // Never join here. Stop() runs on LogonUI's thread, and the worker may be blocked
+  // inside a callback that only LogonUI's thread can complete - an unbounded join
+  // deadlocks the logon screen (it freezes on the welcome screen and the machine
+  // has to be powered off). Detach it; the worker exits on its own.
+  if(m_ListenThread.joinable()) {
+    spdlog::warn("Listen thread detached on stop (non-blocking stop).");
+    m_ListenThread.detach();
+  }
 }
 
 void CUnlockListener::ResetFailures() {
   m_ConsecutiveFailures = 0;
 }
 
-// Every message from the listen thread reaches LogonUI through this function. Once
-// an external Stop() is in flight, LogonUI's UI thread is blocked joining this
-// thread, so any callback would deadlock the logon screen (it freezes on the
-// welcome screen and the machine has to be powered off). Skip them instead.
-void CUnlockListener::PushMessage(const std::string &message) {
-  if(m_StopRequested || m_Credential == nullptr)
+bool CUnlockListener::IsCurrent(uint64_t generation) const {
+  return !m_StopRequested && m_Generation.load() == generation;
+}
+
+// Every message from the listen thread reaches LogonUI through this function.
+// While a worker is stale (stopped or superseded by a newer Start) LogonUI's own
+// thread may be blocked waiting for us, so touching the credential's UI would
+// deadlock the logon screen. Skip the update instead.
+void CUnlockListener::PushMessage(uint64_t generation, const std::string &message) {
+  if(m_Credential == nullptr || !IsCurrent(generation))
     return;
   m_Credential->UpdateMessage(message);
 }
@@ -82,13 +107,13 @@ void GetAllKeyState(byte *keys, size_t len) {
   }
 }
 
-void CUnlockListener::ListenThread() {
+void CUnlockListener::ListenThread(uint64_t generation, const std::shared_ptr<std::atomic<bool>> &workerRunning) {
   // Init
-  PushMessage(I18n::Get("initializing"));
+  PushMessage(generation, I18n::Get("initializing"));
   const auto userDomainStr = StringUtils::FromWideString(m_UserDomain);
   const auto userSplit = StringUtils::Split(userDomainStr, "\\");
   if(userSplit.size() != 2) {
-    PushMessage(I18n::Get("error_invalid_user"));
+    PushMessage(generation, I18n::Get("error_invalid_user"));
     return;
   }
 
@@ -104,13 +129,13 @@ void CUnlockListener::ListenThread() {
 
     // Network
     if(waitForNetwork) {
-      PushMessage(I18n::Get("wait_network"));
-      while(m_IsRunning) {
+      PushMessage(generation, I18n::Get("wait_network"));
+      while(IsCurrent(generation) && workerRunning->load()) {
         auto isAbort = GetAsyncKeyState(VK_LCONTROL) < 0 && GetAsyncKeyState(VK_LMENU) < 0;
         if(NetworkHelper::HasLANConnection() || isAbort) {
           if(isAbort) {
             m_HasResponse = true;
-            PushMessage(I18n::Get("unlock_canceled"));
+            PushMessage(generation, I18n::Get("unlock_canceled"));
             return;
           }
           break;
@@ -124,10 +149,10 @@ void CUnlockListener::ListenThread() {
       const bool isUnlock = m_ProviderUsage == CPUS_UNLOCK_WORKSTATION || (m_ProviderUsage == CPUS_LOGON && isUserLoggedOn);
       if(storage.winUnlockBehavior == "key_press"  || (storage.winUnlockBehavior == "key_press_lock_only" && isUnlock)) {
         Sleep(500);
-        PushMessage(I18n::Get("wait_key_press"));
+        PushMessage(generation, I18n::Get("wait_key_press"));
         byte lastKeys[KEY_RANGE];
         GetAllKeyState(lastKeys, KEY_RANGE);
-        while(m_IsRunning) {
+        while(IsCurrent(generation) && workerRunning->load()) {
           byte keys[KEY_RANGE];
           GetAllKeyState(keys, KEY_RANGE);
           if(memcmp(keys, lastKeys, KEY_RANGE) != 0)
@@ -137,7 +162,7 @@ void CUnlockListener::ListenThread() {
       } else if(storage.winUnlockBehavior == "foreground_always" || (storage.winUnlockBehavior == "foreground_lock_only" && isUnlock)) {
         // HACK: Might not be 100% reliable
         DWORD currentProcessId = GetCurrentProcessId();
-        while(m_IsRunning) {
+        while(IsCurrent(generation) && workerRunning->load()) {
           if(HWND hwndForeground = GetForegroundWindow()) {
             DWORD foregroundProcessId = 0;
             GetWindowThreadProcessId(hwndForeground, &foregroundProcessId);
@@ -151,14 +176,21 @@ void CUnlockListener::ListenThread() {
     }
   }
 
-  // Unlock
-  std::function<void(const std::string&)> printMessage = [this](const std::string &s) { PushMessage(s); };
-  auto handler = UnlockHandler(printMessage);
-  const auto result = handler.GetResult(userDomainStr, "Windows-Login", &m_IsRunning);
+  // A stop or a newer listener supersedes this worker: do not touch the network or
+  // the logon screen any further, just exit quietly.
+  if(!IsCurrent(generation) || !workerRunning->load()) {
+    spdlog::info("Listener superseded or stopped before unlock, logon UI callbacks suppressed.");
+    return;
+  }
 
-  // External Stop(): LogonUI is waiting on this thread and must not be re-entered
-  // from here, otherwise the logon screen can deadlock.
-  if(m_StopRequested) {
+  // Unlock
+  std::function<void(const std::string&)> printMessage = [this, generation](const std::string &s) { PushMessage(generation, s); };
+  auto handler = UnlockHandler(printMessage);
+  const auto result = handler.GetResult(userDomainStr, "Windows-Login", workerRunning.get());
+
+  // External Stop(): LogonUI may be blocked waiting for this thread and must not be
+  // re-entered from here, otherwise the logon screen can deadlock.
+  if(!IsCurrent(generation)) {
     spdlog::info("Listener stopped externally, logon UI callbacks suppressed.");
     return;
   }
@@ -170,6 +202,6 @@ void CUnlockListener::ListenThread() {
     m_ConsecutiveFailures++;
   m_Credential->SetUnlockData(result);
   if(m_ConsecutiveFailures >= MAX_CONSECUTIVE_FAILURES)
-    PushMessage(I18n::Get("unlock_retry_limit"));
+    PushMessage(generation, I18n::Get("unlock_retry_limit"));
   m_CredentialProvider->UpdateCredsStatus();
 }

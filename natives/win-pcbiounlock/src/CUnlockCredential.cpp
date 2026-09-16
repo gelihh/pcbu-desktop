@@ -105,6 +105,12 @@ bool CUnlockCredential::IsSelected() const {
   return _isSelected;
 }
 
+void CUnlockCredential::StopListener() {
+  if(_pUnlockListener != nullptr) {
+    _pUnlockListener->Stop();
+  }
+}
+
 bool CUnlockCredential::IsUnlockSuccess() const {
   std::lock_guard<std::mutex> lock(_mutex);
   return _unlockResult.state == UnlockState::SUCCESS;

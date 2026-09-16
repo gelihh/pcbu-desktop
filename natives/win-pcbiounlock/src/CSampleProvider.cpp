@@ -38,6 +38,10 @@ CSampleProvider::CSampleProvider()
 }
 
 CSampleProvider::~CSampleProvider() {
+  // Stop listener threads first: credentials report back to this provider, so no
+  // worker may outlive it once we start tearing down.
+  for(const auto cred : _pCredentials)
+    cred->StopListener();
   for(const auto cred : _pCredentials)
     cred->Release();
   _pCredentials.clear();

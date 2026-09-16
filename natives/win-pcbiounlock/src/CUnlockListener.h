@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -22,12 +24,22 @@ public:
   bool HasResponse() const;
 
 private:
-  void ListenThread();
-  void PushMessage(const std::string &message);
+  void ListenThread(uint64_t generation, const std::shared_ptr<std::atomic<bool>> &workerRunning);
+  void PushMessage(uint64_t generation, const std::string &message);
+  bool IsCurrent(uint64_t generation) const;
 
   std::thread m_ListenThread{};
   std::atomic<bool> m_IsRunning{};
+  // Per-worker abort flag. A new worker gets a fresh flag, so stopping and starting
+  // again (Retry) cannot re-arm the previous worker's network waits.
+  std::shared_ptr<std::atomic<bool>> m_WorkerRunning{};
+  // Set while an external Stop() invalidates the running worker. The worker must
+  // never call back into LogonUI once stopping began - doing so can leave the logon
+  // screen waiting on this thread (freeze on the welcome screen) - see PushMessage.
   std::atomic<bool> m_StopRequested{false};
+  // Incremented on every Start()/Stop(). A worker only talks to LogonUI while its
+  // own generation is still the current one.
+  std::atomic<uint64_t> m_Generation{0};
   std::atomic<int> m_ConsecutiveFailures{0};
   bool m_HasResponse{};
   bool m_IgnoreWaitKeyPress{};
